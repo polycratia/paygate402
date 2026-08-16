@@ -76,6 +76,12 @@ digest of the whole payload rather than a nonce field, because every scheme
 carries its own payload shape and reaching into one to find "the nonce" breaks
 as soon as a new scheme appears.
 
+The key is recorded only after verification passes. A payment the facilitator
+rejected never touched the chain, and the client who fixes their allowance may
+legitimately resend the same signed payload. Once settlement has been attempted
+the payment stays spent, even on failure — the ambiguous case must never risk a
+double charge.
+
 The default store lives in the process. That is right for one instance and
 wrong for several — with more than one replica a payment could be replayed once
 per replica — so `SeenStore` is an interface and a shared implementation drops

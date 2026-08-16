@@ -44,15 +44,6 @@ func (g *Gate) Handler(next http.Handler) http.Handler {
 			return
 		}
 
-		store := g.Seen
-		if store == nil {
-			store = defaultStore
-		}
-		if store.SeenBefore(PaymentKey(payment), g.replayWindow()) {
-			g.challenge(w, "this payment has already been used")
-			return
-		}
-
 		verification, err := g.Facilitator.Verify(r.Context(), payment, terms)
 		if err != nil {
 			// The facilitator is unreachable. This is the server's problem, not
@@ -62,6 +53,21 @@ func (g *Gate) Handler(next http.Handler) http.Handler {
 		}
 		if !verification.Valid {
 			g.challenge(w, orDefault(verification.Reason, "payment was not accepted"))
+			return
+		}
+
+		// The replay key is recorded only after verification passes. Recording
+		// at first sight would burn a payment the facilitator rejected — the
+		// client fixes the allowance and legitimately resends the same signed
+		// payload. Once recorded the payment stays spent even if settlement
+		// then fails: a settlement attempt may have reached the chain, and the
+		// ambiguous case must never risk a double charge.
+		store := g.Seen
+		if store == nil {
+			store = defaultStore
+		}
+		if store.SeenBefore(PaymentKey(payment), g.replayWindow()) {
+			g.challenge(w, "this payment has already been used")
 			return
 		}
 

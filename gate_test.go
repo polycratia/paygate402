@@ -189,6 +189,34 @@ func TestAPaymentCannotBeUsedTwice(t *testing.T) {
 	}
 }
 
+// A payment rejected at verification never touched the chain, so the same
+// signed payload must be retryable: the client fixes the allowance and resends.
+// Burning the key at first sight would make every verification failure final.
+func TestARejectedPaymentCanBeRetriedAfterTheProblemIsFixed(t *testing.T) {
+	facilitator := &StaticFacilitator{
+		Verification: Verification{Valid: false, Reason: "insufficient allowance"},
+	}
+	g := gate(facilitator)
+	captured := header(t, payment("1"))
+
+	if first := request(t, g, captured); first.Code != http.StatusPaymentRequired {
+		t.Fatalf("first attempt: status = %d, want 402", first.Code)
+	}
+
+	// The client fixes the allowance; the facilitator now accepts.
+	facilitator.Verification = Verification{Valid: true}
+	facilitator.Settlement = Settlement{Success: true}
+
+	second := request(t, g, captured)
+	if second.Code != http.StatusOK {
+		t.Fatalf("retry after fixing: status = %d, want 200; body %s", second.Code, second.Body)
+	}
+	// And only now is the payment spent.
+	if third := request(t, g, captured); third.Code != http.StatusPaymentRequired {
+		t.Errorf("replay after settlement: status = %d, want 402", third.Code)
+	}
+}
+
 // An unreachable facilitator is this server's problem. Answering 402 would tell
 // the client to pay again for something they may have already paid.
 func TestAnUnreachableFacilitatorIsNotTheClientsFault(t *testing.T) {
