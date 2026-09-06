@@ -87,6 +87,32 @@ wrong for several — with more than one replica a payment could be replayed onc
 per replica — so `SeenStore` is an interface and a shared implementation drops
 straight in.
 
+## Quotes
+
+A quote is the priced offer behind a `402`: an amount, an asset, the moment the
+offer stops standing, and a nonce that makes it one of a kind. It is signed with
+this server's own key, so an offer that comes back can be checked against what
+was actually offered rather than against what a client says was offered.
+
+```go
+signer := &paygate402.QuoteSigner{Key: secret, TTL: time.Minute}
+
+quote, err := signer.Issue(terms)
+// …later, with the quote a client returned:
+err = signer.Verify(quote) // the signature first, then the expiry
+```
+
+The signature covers a canonical form rather than the JSON: a domain tag, then
+every set field in a fixed order, each part written as its length followed by
+its bytes. Lengths rather than separators mean no value can be read as two
+fields, and a field left empty is not written at all — so a field added in a
+later version leaves the signed bytes of an older quote exactly as they were,
+and signatures issued before it keep verifying. The expiry is signed as whole
+Unix seconds.
+
+That signature is this server's, not a chain's. It says "these were my terms",
+and nothing about whether anyone paid.
+
 ## Status
 
 Early, and pinned to a moving target: x402 is young, and this speaks
@@ -95,9 +121,9 @@ message rather than interpreted hopefully.
 
 | | |
 |---|---|
-| Implemented | 402 challenge, `X-PAYMENT` codec, terms matching, replay protection, facilitator client, settlement ordering, payer on the context |
+| Implemented | 402 challenge, `X-PAYMENT` codec, terms matching, replay protection, facilitator client, settlement ordering, payer on the context, signed quotes with a canonical serialisation |
 | Delegated | signature verification, allowance checks, settlement — all to the facilitator |
-| Not yet | multiple concurrent schemes per resource, dynamic pricing per request, a shared replay store, `X-PAYMENT-RESPONSE` verification on the client side |
+| Not yet | quotes carried on the 402 challenge and checked on the way back, multiple concurrent schemes per resource, dynamic pricing per request, a shared replay store, `X-PAYMENT-RESPONSE` verification on the client side |
 
 Go 1.24 or newer. No dependencies outside the standard library.
 
@@ -111,3 +137,5 @@ make demo   # the transcript above
 ## License
 
 MIT
+
+Built by [polycratia](https://polycratia.com).
