@@ -1,7 +1,11 @@
 package paygate402
 
 import (
+	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -31,6 +35,36 @@ func quote() Quote {
 	}
 }
 
+// canonicalParts is the signed form of quote(), written out as the sequence of
+// parts it is: the domain tag, then each set field as a name and a value.
+func canonicalParts() []string {
+	return []string{
+		"paygate402/quote/v1",
+		"amount", "10000",
+		"asset", "0x0000000000000000000000000000000000000002",
+		"expiry", "1800000000",
+		"network", "base",
+		"nonce", "0123456789abcdef0123456789abcdef",
+		"payTo", "0x0000000000000000000000000000000000000001",
+		"resource", "https://api.example.com/report",
+	}
+}
+
+// canonicalBytes writes the parts the way the format says they are written,
+// independently of the code under test: a length, then the bytes. Every part
+// here is shorter than 128 bytes, so every length is a single byte.
+func canonicalBytes(parts []string) []byte {
+	var out []byte
+	for _, part := range parts {
+		if len(part) > 127 {
+			panic("canonicalBytes only writes single-byte lengths")
+		}
+		out = append(out, byte(len(part)))
+		out = append(out, part...)
+	}
+	return out
+}
+
 // parts reads the canonical form back out, so the layout can be asserted
 // without a hand-computed digest in the test.
 func parts(t *testing.T, canonical []byte) []string {
@@ -55,16 +89,7 @@ func parts(t *testing.T, canonical []byte) []string {
 // over do not move. Changing this test means invalidating every signature that
 // was ever issued, so it should be read as a version bump, not a fix.
 func TestCanonicalFormIsFixed(t *testing.T) {
-	want := []string{
-		"paygate402/quote/v1",
-		"amount", "10000",
-		"asset", "0x0000000000000000000000000000000000000002",
-		"expiry", "1800000000",
-		"network", "base",
-		"nonce", "0123456789abcdef0123456789abcdef",
-		"payTo", "0x0000000000000000000000000000000000000001",
-		"resource", "https://api.example.com/report",
-	}
+	want := canonicalParts()
 	got := parts(t, quote().Canonical())
 	if len(got) != len(want) {
 		t.Fatalf("canonical parts = %q, want %q", got, want)
@@ -76,6 +101,16 @@ func TestCanonicalFormIsFixed(t *testing.T) {
 	}
 	if string(quote().Canonical()) != string(quote().Canonical()) {
 		t.Error("the same quote serialised differently twice")
+	}
+}
+
+// And the same promise at the level of bytes rather than parts: a reader who
+// only has the format description must be able to rebuild them exactly, or a
+// signature issued today will not verify against another implementation.
+func TestCanonicalBytesAreExactlyTheDocumentedEncoding(t *testing.T) {
+	want := canonicalBytes(canonicalParts())
+	if got := quote().Canonical(); !bytes.Equal(got, want) {
+		t.Errorf("canonical = %x, want %x", got, want)
 	}
 }
 
@@ -112,6 +147,29 @@ func TestTheSignatureIsNotPartOfWhatIsSigned(t *testing.T) {
 	}
 }
 
+// The signature is HMAC-SHA256 over the canonical bytes, hex encoded, and it is
+// the same signature every time. Computed here from the format alone, so the
+// algorithm and the encoding are pinned along with the layout.
+func TestTheSignatureIsHMACOverTheCanonicalForm(t *testing.T) {
+	signed, err := quoteSigner(1799999900).Sign(quote())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := hmac.New(sha256.New, quoteKey())
+	sum.Write(canonicalBytes(canonicalParts()))
+	if want := hex.EncodeToString(sum.Sum(nil)); signed.Signature != want {
+		t.Errorf("signature = %s, want %s", signed.Signature, want)
+	}
+
+	again, err := quoteSigner(1799999900).Sign(quote())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Signature != signed.Signature {
+		t.Error("the same quote signed differently twice")
+	}
+}
+
 func TestAnIssuedQuoteVerifies(t *testing.T) {
 	signer := quoteSigner(1800000000)
 	issued, err := signer.Issue(terms())
@@ -137,6 +195,25 @@ func TestAnIssuedQuoteVerifies(t *testing.T) {
 	}
 	if again.Nonce == issued.Nonce {
 		t.Error("two quotes were issued with the same nonce")
+	}
+}
+
+// The expiry is signed as whole seconds, so an issued quote must carry whole
+// seconds too: otherwise the moment a client reads is not the moment the
+// signature covers, and the difference is unsigned.
+func TestAnIssuedExpiryTravelsAsItIsSigned(t *testing.T) {
+	signer := &QuoteSigner{
+		Key: quoteKey(),
+		TTL: time.Minute,
+		Now: func() time.Time { return time.Unix(1800000000, 500_000_000) },
+	}
+	issued, err := signer.Issue(terms())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if issued.Expiry.Nanosecond() != 0 || issued.Expiry.Unix() != 1800000060 {
+		t.Errorf("expiry = %s, want the whole second the signature covers",
+			issued.Expiry.UTC().Format(time.RFC3339Nano))
 	}
 }
 

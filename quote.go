@@ -155,8 +155,10 @@ func (s *QuoteSigner) Issue(terms Requirements) (Quote, error) {
 		Network:  terms.Network,
 		Resource: terms.Resource,
 		PayTo:    terms.PayTo,
-		Expiry:   s.now().Add(s.ttl()),
-		Nonce:    nonce,
+		// Truncated to the precision it is signed at, so the instant a client
+		// reads out of the quote is the instant the signature covers.
+		Expiry: s.now().Add(s.ttl()).Truncate(time.Second).UTC(),
+		Nonce:  nonce,
 	})
 }
 
