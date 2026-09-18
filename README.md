@@ -57,6 +57,35 @@ So the payment payload stays opaque, and matching compares only what a web layer
 can honestly compare: the scheme and the network. The amount, the asset and the
 recipient are checked by the component that can read the payload.
 
+## Testing without a chain
+
+Verification goes through the `Facilitator` interface, so nothing here needs a
+chain to be exercised. Two stand-ins come with the package.
+
+`StaticFacilitator` answers from a fixed script and never looks at the payment.
+That is what a test about ordering, status codes or replay wants: the verdict is
+the fixture.
+
+`MockFacilitator` behaves like a facilitator instead. It keeps balances in
+memory, reads the payload it defines, and checks the payer, the amount, the
+asset and the recipient — the fields a web layer cannot honestly check — before
+moving mock money.
+
+```go
+facilitator := &paygate402.MockFacilitator{
+	Balances: map[string]int64{"0xc0ffee": 50_000},
+}
+
+payment, err := paygate402.MockPayment(terms, "0xc0ffee")
+header, err := paygate402.EncodePayment(payment)
+// …send that header through the gate, then:
+facilitator.Balance("0xc0ffee") // 40_000, and the merchant has the charge
+```
+
+It signs nothing and verifies no signature, so it proves the plumbing rather
+than the cryptography. That is the point of the seam: the cryptography lives on
+the other side of it.
+
 ## The two orderings that matter
 
 **Settle after the handler, serve after settlement.** The handler runs into a
@@ -121,7 +150,7 @@ message rather than interpreted hopefully.
 
 | | |
 |---|---|
-| Implemented | 402 challenge, `X-PAYMENT` codec, terms matching, replay protection, facilitator client, settlement ordering, payer on the context, signed quotes with a canonical serialisation |
+| Implemented | 402 challenge, `X-PAYMENT` codec, terms matching, replay protection, facilitator client, a mock facilitator with in-memory balances, settlement ordering, payer on the context, signed quotes with a canonical serialisation |
 | Delegated | signature verification, allowance checks, settlement — all to the facilitator |
 | Not yet | quotes carried on the 402 challenge and checked on the way back, multiple concurrent schemes per resource, dynamic pricing per request, a shared replay store, `X-PAYMENT-RESPONSE` verification on the client side |
 
