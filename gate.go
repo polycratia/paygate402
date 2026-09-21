@@ -124,7 +124,7 @@ func (g *Gate) replayWindow() time.Duration {
 	if g.ReplayWindow > 0 {
 		return g.ReplayWindow
 	}
-	return time.Hour
+	return DefaultReplayWindow
 }
 
 // challenge writes the 402 that tells a client what would be accepted.

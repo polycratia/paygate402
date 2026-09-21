@@ -111,10 +111,31 @@ legitimately resend the same signed payload. Once settlement has been attempted
 the payment stays spent, even on failure — the ambiguous case must never risk a
 double charge.
 
+A spent payment does not have to be remembered forever. It has to be remembered
+until the offer behind it stops standing, plus a margin for the difference
+between the clock that stamped the quote and the clock that reads it:
+`ReplayWindowFor(quote, time.Now(), 0)` is that arithmetic. Shorter leaves a
+window open; longer only makes the store grow.
+
 The default store lives in the process. That is right for one instance and
 wrong for several — with more than one replica a payment could be replayed once
 per replica — so `SeenStore` is an interface and a shared implementation drops
 straight in.
+
+`FileStore` puts the same store in a file, so a restart does not hand a captured
+header a second chance. It is an append-only log, rewritten when the expired
+entries outnumber the live ones, and entries whose window has closed are dropped
+on load as well as on every write.
+
+```go
+store, err := paygate402.NewFileStore("/var/lib/paygate402/seen")
+defer store.Close()
+gate.Seen = store
+```
+
+A store that cannot write goes on refusing replays from memory — a full disk
+must not open the gate — and says so through `store.Err()`, because the
+protection has quietly become the weaker one. One file is still one machine.
 
 ## Quotes
 
@@ -150,9 +171,9 @@ message rather than interpreted hopefully.
 
 | | |
 |---|---|
-| Implemented | 402 challenge, `X-PAYMENT` codec, terms matching, replay protection, facilitator client, a mock facilitator with in-memory balances, settlement ordering, payer on the context, signed quotes with a canonical serialisation |
+| Implemented | 402 challenge, `X-PAYMENT` codec, terms matching, replay protection in memory or in a file, facilitator client, a mock facilitator with in-memory balances, settlement ordering, payer on the context, signed quotes with a canonical serialisation |
 | Delegated | signature verification, allowance checks, settlement — all to the facilitator |
-| Not yet | quotes carried on the 402 challenge and checked on the way back, multiple concurrent schemes per resource, dynamic pricing per request, a shared replay store, `X-PAYMENT-RESPONSE` verification on the client side |
+| Not yet | quotes carried on the 402 challenge and checked on the way back, multiple concurrent schemes per resource, dynamic pricing per request, a replay store shared between replicas, `X-PAYMENT-RESPONSE` verification on the client side |
 
 Go 1.24 or newer. No dependencies outside the standard library.
 
