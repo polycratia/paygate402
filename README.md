@@ -163,6 +163,31 @@ Unix seconds.
 That signature is this server's, not a chain's. It says "these were my terms",
 and nothing about whether anyone paid.
 
+### Quotes on the gate
+
+Giving the gate a signer makes it offer a quote with every `402` and check the
+one that comes back:
+
+```go
+gate.Quotes = &paygate402.QuoteSigner{Key: secret, TTL: time.Minute}
+```
+
+The `402` then carries one `X-PAYMENT-QUOTE` header per accepted term — base64
+of the signed quote, in the order of `accepts`. The client repeats the request
+with `X-PAYMENT` and the `X-PAYMENT-QUOTE` it chose, and the gate checks three
+things before the facilitator is asked anything: that this server signed the
+offer, that the offer has not run out, and that it is the offer for the terms
+being paid for. A signature alone would only say the quote was issued here, not
+that it was issued for what is being bought now.
+
+With a signer in place the replay window stops being a fixed hour and becomes
+the offer's own: a payment is remembered until the quote behind it could no
+longer be presented, plus the safety margin.
+
+The gate without a signer is unchanged — it takes any payment that matches its
+terms, which is the right shape when prices are static and a stale offer costs
+nothing.
+
 ## Status
 
 Early, and pinned to a moving target: x402 is young, and this speaks
@@ -171,9 +196,9 @@ message rather than interpreted hopefully.
 
 | | |
 |---|---|
-| Implemented | 402 challenge, `X-PAYMENT` codec, terms matching, replay protection in memory or in a file, facilitator client, a mock facilitator with in-memory balances, settlement ordering, payer on the context, signed quotes with a canonical serialisation |
+| Implemented | 402 challenge, `X-PAYMENT` codec, terms matching, replay protection in memory or in a file, facilitator client, a mock facilitator with in-memory balances, settlement ordering, payer on the context, signed quotes with a canonical serialisation, quotes carried on the 402 and checked on the way back |
 | Delegated | signature verification, allowance checks, settlement — all to the facilitator |
-| Not yet | quotes carried on the 402 challenge and checked on the way back, multiple concurrent schemes per resource, dynamic pricing per request, a replay store shared between replicas, `X-PAYMENT-RESPONSE` verification on the client side |
+| Not yet | multiple concurrent schemes per resource, dynamic pricing per request, a replay store shared between replicas, `X-PAYMENT-RESPONSE` verification on the client side |
 
 Go 1.24 or newer. No dependencies outside the standard library.
 

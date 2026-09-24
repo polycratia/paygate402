@@ -4,8 +4,10 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -18,11 +20,19 @@ import (
 // that were already signed.
 const quoteDomain = "paygate402/quote/v1"
 
+// QuoteHeader carries a signed quote. It is this package's own header, not one
+// x402 defines: the 402 sends the offer behind each set of terms, and a client
+// sends back the offer it is answering.
+const QuoteHeader = "X-PAYMENT-QUOTE"
+
 // Errors a caller may want to distinguish when handling quotes.
 var (
 	ErrQuoteIncomplete = errors.New("quote is incomplete")
 	ErrQuoteSignature  = errors.New("quote signature does not verify")
 	ErrQuoteExpired    = errors.New("quote has expired")
+	ErrQuoteMismatch   = errors.New("quote is not an offer for these terms")
+	ErrQuoteMalformed  = errors.New("quote header could not be decoded")
+	ErrNoQuote         = errors.New("no quote presented")
 	ErrNoQuoteKey      = errors.New("paygate402: no quote signing key configured")
 )
 
@@ -124,11 +134,64 @@ func (q Quote) Expired(now time.Time) bool {
 	return now.Unix() >= q.Expiry.Unix()
 }
 
+// Covers reports whether this quote is the offer behind these terms.
+//
+// A signature says the server issued the quote, not that it issued it for what
+// is being bought now. Without this check a quote for the cheapest resource on
+// a server would stand as the offer behind the most expensive one.
+func (q Quote) Covers(terms Requirements) error {
+	for _, field := range []struct{ name, quoted, required string }{
+		{"amount", q.Amount, terms.MaxAmountRequired},
+		{"asset", q.Asset, terms.Asset},
+		{"network", q.Network, terms.Network},
+		{"payTo", q.PayTo, terms.PayTo},
+		{"resource", q.Resource, terms.Resource},
+	} {
+		if field.quoted != field.required {
+			return fmt.Errorf("%w: it offers %s %q, the terms ask for %q",
+				ErrQuoteMismatch, field.name, field.quoted, field.required)
+		}
+	}
+	return nil
+}
+
 func (q Quote) mac(key []byte) []byte {
 	q.Signature = ""
 	sum := hmac.New(sha256.New, key)
 	sum.Write(q.Canonical())
 	return sum.Sum(nil)
+}
+
+// EncodeQuote produces an X-PAYMENT-QUOTE header value: base64 of the quote's
+// JSON, so an offer travels in a header with no question of escaping.
+func EncodeQuote(quote Quote) (string, error) {
+	body, err := json.Marshal(quote)
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(body), nil
+}
+
+// DecodeQuote reads an X-PAYMENT-QUOTE header. It says what the client sent,
+// not that the server ever offered it: QuoteSigner.Verify decides that.
+func DecodeQuote(header string) (Quote, error) {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return Quote{}, ErrNoQuote
+	}
+	raw, err := base64.StdEncoding.DecodeString(header)
+	if err != nil {
+		// Some clients strip padding; try the tolerant alphabet before giving up.
+		raw, err = base64.RawStdEncoding.DecodeString(header)
+		if err != nil {
+			return Quote{}, fmt.Errorf("%w: %v", ErrQuoteMalformed, err)
+		}
+	}
+	var quote Quote
+	if err := json.Unmarshal(raw, &quote); err != nil {
+		return Quote{}, fmt.Errorf("%w: %v", ErrQuoteMalformed, err)
+	}
+	return quote, nil
 }
 
 // QuoteSigner issues quotes and checks the ones that come back. The key is this

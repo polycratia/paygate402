@@ -15,10 +15,16 @@ type Gate struct {
 	Accepts []Requirements
 	// Facilitator verifies and settles. Required.
 	Facilitator Facilitator
+	// Quotes, when set, signs the offer that goes out with every 402 and checks
+	// the one that comes back. Without it the gate takes any payment matching
+	// the terms; with it a payment must answer an offer this server made and
+	// that has not run out.
+	Quotes *QuoteSigner
 	// Seen prevents replay. A memory store is used when this is nil, which is
 	// correct for a single instance and wrong for several — see MemoryStore.
 	Seen SeenStore
-	// ReplayWindow is how long a used payment is remembered. Defaults to an hour.
+	// ReplayWindow is how long a used payment is remembered. Defaults to an hour,
+	// and is superseded by the offer's own lifetime when Quotes is set.
 	ReplayWindow time.Duration
 	// Logger receives settlement failures, which are the events an operator
 	// most needs to see: the work was done and the money did not arrive.
@@ -44,6 +50,21 @@ func (g *Gate) Handler(next http.Handler) http.Handler {
 			return
 		}
 
+		// The offer comes before the facilitator: a payment answering no offer
+		// this server made, or one that has run out, is not a question worth
+		// putting to a facilitator.
+		window := g.replayWindow()
+		if g.Quotes != nil {
+			offer, err := g.presented(r, terms)
+			if err != nil {
+				g.challenge(w, reason(err))
+				return
+			}
+			// A payment only has to be remembered while the offer behind it could
+			// still be presented, and the offer says when that stops.
+			window = ReplayWindowFor(offer, g.Quotes.now(), 0)
+		}
+
 		verification, err := g.Facilitator.Verify(r.Context(), payment, terms)
 		if err != nil {
 			// The facilitator is unreachable. This is the server's problem, not
@@ -66,7 +87,7 @@ func (g *Gate) Handler(next http.Handler) http.Handler {
 		if store == nil {
 			store = defaultStore
 		}
-		if store.SeenBefore(PaymentKey(payment), g.replayWindow()) {
+		if store.SeenBefore(PaymentKey(payment), window) {
 			g.challenge(w, "this payment has already been used")
 			return
 		}
@@ -117,7 +138,41 @@ func (g *Gate) validate() error {
 	if g.Facilitator == nil {
 		return errors.New("paygate402: no facilitator configured")
 	}
+	if g.Quotes != nil && len(g.Quotes.Key) == 0 {
+		return ErrNoQuoteKey
+	}
 	return nil
+}
+
+// presented reads the offer the retried request is answering: this server's
+// signature, still inside its window, and for the terms being paid for.
+func (g *Gate) presented(r *http.Request, terms Requirements) (Quote, error) {
+	offer, err := DecodeQuote(r.Header.Get(QuoteHeader))
+	if err != nil {
+		return Quote{}, err
+	}
+	if err := g.Quotes.Verify(offer); err != nil {
+		return Quote{}, err
+	}
+	return offer, offer.Covers(terms)
+}
+
+// offers signs one quote per set of accepted terms, in the order they are
+// accepted, so a client can tell which offer belongs to which terms.
+func (g *Gate) offers() ([]string, error) {
+	encoded := make([]string, 0, len(g.Accepts))
+	for _, terms := range g.Accepts {
+		offer, err := g.Quotes.Issue(terms)
+		if err != nil {
+			return nil, err
+		}
+		header, err := EncodeQuote(offer)
+		if err != nil {
+			return nil, err
+		}
+		encoded = append(encoded, header)
+	}
+	return encoded, nil
 }
 
 func (g *Gate) replayWindow() time.Duration {
@@ -127,8 +182,22 @@ func (g *Gate) replayWindow() time.Duration {
 	return DefaultReplayWindow
 }
 
-// challenge writes the 402 that tells a client what would be accepted.
+// challenge writes the 402 that tells a client what would be accepted, and,
+// when this gate signs quotes, the offer behind each set of terms.
 func (g *Gate) challenge(w http.ResponseWriter, why string) {
+	if g.Quotes != nil {
+		offers, err := g.offers()
+		if err != nil {
+			// A 402 without the offer it promises asks a client to pay against
+			// terms this server will then refuse, so it is not sent at all.
+			g.log("quote could not be issued", "error", err)
+			http.Error(w, "payment quote is unavailable", http.StatusInternalServerError)
+			return
+		}
+		for _, offer := range offers {
+			w.Header().Add(QuoteHeader, offer)
+		}
+	}
 	body, err := json.Marshal(Challenge{
 		X402Version: Version,
 		Error:       why,
@@ -188,6 +257,8 @@ func reason(err error) string {
 	switch {
 	case errors.Is(err, ErrNoPayment):
 		return "payment required"
+	case errors.Is(err, ErrNoQuote):
+		return "this request did not carry the quote it is answering"
 	default:
 		return err.Error()
 	}
