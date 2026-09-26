@@ -6,13 +6,21 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 )
 
 // Gate wraps a handler so that it only runs for paid requests.
 type Gate struct {
-	// Accepts lists the terms this resource will take. At least one is required.
+	// Accepts lists the terms this resource will take. Either this or Prices is
+	// required, and setting both is a configuration error.
 	Accepts []Requirements
+	// Prices declares a price per route pattern, for a gate in front of more
+	// than one resource. A route the table does not price is served free.
+	Prices *Prices
+	// Free, when set, lets each client through a few times before any payment
+	// is asked for.
+	Free *Allowance
 	// Facilitator verifies and settles. Required.
 	Facilitator Facilitator
 	// Quotes, when set, signs the offer that goes out with every 402 and checks
@@ -39,14 +47,34 @@ func (g *Gate) Handler(next http.Handler) http.Handler {
 			return
 		}
 
-		payment, err := DecodePayment(r.Header.Get(PaymentHeader))
-		if err != nil {
-			g.challenge(w, reason(err))
+		accepts, err := g.accepts(r)
+		switch {
+		case errors.Is(err, ErrNoPrice):
+			// The table is the whole statement of what is sold here, so a route
+			// missing from it is free rather than closed.
+			next.ServeHTTP(w, r)
+			return
+		case err != nil:
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		terms, err := Match(payment, g.Accepts)
+
+		// The free tier is spent before the payment is even read: a client that
+		// does not have to pay yet is not asked to, and a payment it sent anyway
+		// is left unspent rather than taken.
+		if client, left, granted := g.Free.take(r); granted {
+			g.serveFree(w, r, next, client, left)
+			return
+		}
+
+		payment, err := DecodePayment(r.Header.Get(PaymentHeader))
 		if err != nil {
-			g.challenge(w, err.Error())
+			g.challenge(w, accepts, reason(err))
+			return
+		}
+		terms, err := Match(payment, accepts)
+		if err != nil {
+			g.challenge(w, accepts, err.Error())
 			return
 		}
 
@@ -57,7 +85,7 @@ func (g *Gate) Handler(next http.Handler) http.Handler {
 		if g.Quotes != nil {
 			offer, err := g.presented(r, terms)
 			if err != nil {
-				g.challenge(w, reason(err))
+				g.challenge(w, accepts, reason(err))
 				return
 			}
 			// A payment only has to be remembered while the offer behind it could
@@ -73,7 +101,7 @@ func (g *Gate) Handler(next http.Handler) http.Handler {
 			return
 		}
 		if !verification.Valid {
-			g.challenge(w, orDefault(verification.Reason, "payment was not accepted"))
+			g.challenge(w, accepts, orDefault(verification.Reason, "payment was not accepted"))
 			return
 		}
 
@@ -88,7 +116,7 @@ func (g *Gate) Handler(next http.Handler) http.Handler {
 			store = defaultStore
 		}
 		if store.SeenBefore(PaymentKey(payment), window) {
-			g.challenge(w, "this payment has already been used")
+			g.challenge(w, accepts, "this payment has already been used")
 			return
 		}
 
@@ -112,7 +140,7 @@ func (g *Gate) Handler(next http.Handler) http.Handler {
 			return
 		case !settlement.Success:
 			g.log("settlement declined", "reason", settlement.ErrorReason)
-			g.challenge(w, orDefault(settlement.ErrorReason, "payment could not be settled"))
+			g.challenge(w, accepts, orDefault(settlement.ErrorReason, "payment could not be settled"))
 			return
 		}
 
@@ -127,7 +155,12 @@ func (g *Gate) Handler(next http.Handler) http.Handler {
 var defaultStore = NewMemoryStore()
 
 func (g *Gate) validate() error {
-	if len(g.Accepts) == 0 {
+	switch {
+	case g.Prices != nil && len(g.Accepts) > 0:
+		// Two ways to say the same thing, settled by asking rather than by a
+		// precedence rule nobody would remember.
+		return errors.New("paygate402: set either Accepts or Prices, not both")
+	case g.Prices == nil && len(g.Accepts) == 0:
 		return errors.New("paygate402: no accepted terms configured")
 	}
 	for _, terms := range g.Accepts {
@@ -142,6 +175,33 @@ func (g *Gate) validate() error {
 		return ErrNoQuoteKey
 	}
 	return nil
+}
+
+// accepts returns the terms this request would be paid against: the fixed ones,
+// or the ones the pricing table gives this route.
+func (g *Gate) accepts(r *http.Request) ([]Requirements, error) {
+	if g.Prices == nil {
+		return g.Accepts, nil
+	}
+	terms, err := g.Prices.Price(r)
+	if err != nil {
+		return nil, err
+	}
+	return []Requirements{terms}, nil
+}
+
+// serveFree runs the handler on the house. A free request that produced nothing
+// is given back, for the same reason work that failed is never charged for.
+func (g *Gate) serveFree(w http.ResponseWriter, r *http.Request, next http.Handler, client string, left int) {
+	recorder := &recorder{header: http.Header{}, status: http.StatusOK}
+	next.ServeHTTP(recorder, r)
+	if recorder.status < 200 || recorder.status >= 300 {
+		g.Free.give(client)
+		recorder.flush(w, "")
+		return
+	}
+	recorder.header.Set(AllowanceHeader, strconv.Itoa(left))
+	recorder.flush(w, "")
 }
 
 // presented reads the offer the retried request is answering: this server's
@@ -159,9 +219,9 @@ func (g *Gate) presented(r *http.Request, terms Requirements) (Quote, error) {
 
 // offers signs one quote per set of accepted terms, in the order they are
 // accepted, so a client can tell which offer belongs to which terms.
-func (g *Gate) offers() ([]string, error) {
-	encoded := make([]string, 0, len(g.Accepts))
-	for _, terms := range g.Accepts {
+func (g *Gate) offers(accepts []Requirements) ([]string, error) {
+	encoded := make([]string, 0, len(accepts))
+	for _, terms := range accepts {
 		offer, err := g.Quotes.Issue(terms)
 		if err != nil {
 			return nil, err
@@ -184,9 +244,9 @@ func (g *Gate) replayWindow() time.Duration {
 
 // challenge writes the 402 that tells a client what would be accepted, and,
 // when this gate signs quotes, the offer behind each set of terms.
-func (g *Gate) challenge(w http.ResponseWriter, why string) {
+func (g *Gate) challenge(w http.ResponseWriter, accepts []Requirements, why string) {
 	if g.Quotes != nil {
-		offers, err := g.offers()
+		offers, err := g.offers(accepts)
 		if err != nil {
 			// A 402 without the offer it promises asks a client to pay against
 			// terms this server will then refuse, so it is not sent at all.
@@ -201,7 +261,7 @@ func (g *Gate) challenge(w http.ResponseWriter, why string) {
 	body, err := json.Marshal(Challenge{
 		X402Version: Version,
 		Error:       why,
-		Accepts:     g.Accepts,
+		Accepts:     accepts,
 	})
 	if err != nil {
 		http.Error(w, "payment required", http.StatusPaymentRequired)
