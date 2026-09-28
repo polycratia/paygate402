@@ -44,6 +44,89 @@ http.Handle("/report", gate.Handler(reportHandler))
 Inside the handler, `paygate402.Payer(r.Context())` gives the address the
 facilitator said paid — its claim, not this package's finding.
 
+## Pricing per route
+
+A gate in front of one resource can carry its terms directly. A gate in front of
+several declares a price per route pattern instead:
+
+```go
+gate := &paygate402.Gate{
+	Prices: &paygate402.Prices{
+		Terms: paygate402.Requirements{
+			Scheme:            "exact",
+			Network:           "base",
+			PayTo:             merchantAddress,
+			Asset:             usdcAddress,
+			MaxTimeoutSeconds: 60,
+		},
+		Routes: []paygate402.Route{
+			{Pattern: "/report", Amount: "10000", Description: "One generated report"},
+			{Pattern: "/reports/{id}", Amount: "2000"},
+			{Pattern: "POST /jobs", Amount: "50000"},
+		},
+		BaseURL: "https://api.example.com",
+	},
+	Facilitator: facilitator,
+}
+
+http.Handle("/", gate.Handler(api))
+```
+
+`Terms` is what does not change from route to route — the scheme, the network,
+the asset, the recipient — and each route supplies the amount. `Accepts` and
+`Prices` are two ways of saying the same thing, so setting both is refused
+rather than settled by a precedence rule nobody would remember.
+
+The patterns are matched by an `http.ServeMux`, so method, wildcards and
+precedence are the standard library's rather than a second dialect invented
+here: `/reports/summary` beats `/reports/{id}` for the same reason it would in
+any Go server. A malformed or repeated pattern is the operator's mistake and
+comes back as a `500`, like the rest of this gate's misconfiguration.
+
+**A route the table does not mention is served free.** The table is the whole
+statement of what is sold here, so a path missing from it is unpriced rather
+than closed — a health check needs no line saying it costs nothing.
+
+The resource each `402` names is `BaseURL` with the request's path appended, or
+the route's own `Resource` when it has one. With neither, the request's own
+scheme and host are used — which is wrong behind a proxy that terminates TLS,
+because the scheme a request arrived under is not the scheme the client used.
+
+## A free tier
+
+```go
+gate.Free = &paygate402.Allowance{Requests: 5, Every: 24 * time.Hour}
+```
+
+Each client gets five requests before any payment is asked for, and every free
+response says how many are left:
+
+```console
+X-PAYMENT-ALLOWANCE: 4
+```
+
+That header is this package's own, not one x402 defines: a client that knows
+when the free tier runs out can have a payment ready instead of learning about
+it from a refusal.
+
+The allowance is spent before the `X-PAYMENT` header is even read, so a client
+that pays while it still has free requests is not charged — the payment is left
+unspent rather than taken. A free request that produced nothing is given back,
+for the same reason work that failed is never charged for.
+
+`Every` is the period the count resets over; zero makes the allowance a lifetime
+one. Clients are told apart by the address the request came from. Forwarded
+headers are not read, because anyone can set one and a free tier that counts a
+header the client controls counts nothing. Behind a proxy, give `Allowance` a
+`Client` function that reads the header the proxy itself sets — or key the tier
+on an API key, which is a client saying who it is on purpose.
+
+It is a courtesy rather than a limit. Before anyone has paid, the only thing a
+request carries is the address it came from, and a new address is a new
+allowance; it exists so that an agent can try an endpoint before paying for it.
+The tally lives in this process unless `Counts` is set, and shares
+`MemoryStore`'s limit: several replicas mean several allowances.
+
 ## Where the boundary is
 
 **This package does not check signatures and does not move money.** In x402
@@ -196,9 +279,9 @@ message rather than interpreted hopefully.
 
 | | |
 |---|---|
-| Implemented | 402 challenge, `X-PAYMENT` codec, terms matching, replay protection in memory or in a file, facilitator client, a mock facilitator with in-memory balances, settlement ordering, payer on the context, signed quotes with a canonical serialisation, quotes carried on the 402 and checked on the way back |
+| Implemented | 402 challenge, `X-PAYMENT` codec, terms matching, a price per route pattern, a free tier per client, replay protection in memory or in a file, facilitator client, a mock facilitator with in-memory balances, settlement ordering, payer on the context, signed quotes with a canonical serialisation, quotes carried on the 402 and checked on the way back |
 | Delegated | signature verification, allowance checks, settlement — all to the facilitator |
-| Not yet | multiple concurrent schemes per resource, dynamic pricing per request, a replay store shared between replicas, `X-PAYMENT-RESPONSE` verification on the client side |
+| Not yet | multiple concurrent schemes per resource, a price that depends on more of the request than its route, a replay store or free-tier counter shared between replicas, `X-PAYMENT-RESPONSE` verification on the client side |
 
 Go 1.24 or newer. No dependencies outside the standard library.
 
