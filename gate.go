@@ -28,6 +28,9 @@ type Gate struct {
 	// the terms; with it a payment must answer an offer this server made and
 	// that has not run out.
 	Quotes *QuoteSigner
+	// Receipts, when set, signs the record of every payment that settles and
+	// returns it on the paid response, for the payer to keep and present.
+	Receipts *ReceiptSigner
 	// Seen prevents replay. A memory store is used when this is nil, which is
 	// correct for a single instance and wrong for several — see MemoryStore.
 	Seen SeenStore
@@ -148,6 +151,17 @@ func (g *Gate) Handler(next http.Handler) http.Handler {
 		if err != nil {
 			g.log("settlement could not be encoded", "error", err)
 		}
+		if g.Receipts != nil {
+			receipt, err := g.receipt(payment, terms, settlement, verification.Payer)
+			if err != nil {
+				// The money has moved and the work is done. A receipt that could
+				// not be signed is an operator's problem to see, not a reason to
+				// withhold a response the client has already paid for.
+				g.log("receipt could not be issued", "error", err)
+			} else {
+				recorder.header.Set(ReceiptHeader, receipt)
+			}
+		}
 		recorder.flush(w, encoded)
 	})
 }
@@ -173,6 +187,9 @@ func (g *Gate) validate() error {
 	}
 	if g.Quotes != nil && len(g.Quotes.Key) == 0 {
 		return ErrNoQuoteKey
+	}
+	if g.Receipts != nil && len(g.Receipts.Key) == 0 {
+		return ErrNoReceiptKey
 	}
 	return nil
 }
@@ -233,6 +250,21 @@ func (g *Gate) offers(accepts []Requirements) ([]string, error) {
 		encoded = append(encoded, header)
 	}
 	return encoded, nil
+}
+
+// receipt signs the record of a settled payment, for the payer to keep.
+//
+// A facilitator may name the payer when it verifies, when it settles, or at
+// both moments; the receipt says who paid either way.
+func (g *Gate) receipt(payment Payment, terms Requirements, settlement Settlement, payer string) (string, error) {
+	if settlement.Payer == "" {
+		settlement.Payer = payer
+	}
+	record, err := g.Receipts.Issue(payment, terms, settlement)
+	if err != nil {
+		return "", err
+	}
+	return EncodeReceipt(record)
 }
 
 func (g *Gate) replayWindow() time.Duration {
