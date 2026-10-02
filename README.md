@@ -271,6 +271,47 @@ The gate without a signer is unchanged — it takes any payment that matches its
 terms, which is the right shape when prices are static and a stale offer costs
 nothing.
 
+## Receipts
+
+A quote is the offer; a receipt is what is left once the money has moved. It
+records which payment settled, who paid, how much, in what asset, to whom, what
+the facilitator reported, and when — signed with this server's own key, so a
+record presented back is checked against what was issued rather than against
+what the holder says was issued.
+
+```go
+gate.Receipts = &paygate402.ReceiptSigner{Key: secret, Issuer: "api.example.com"}
+```
+
+The paid response then carries an `X-PAYMENT-RECEIPT` header — base64 of the
+signed receipt, this package's own header rather than one x402 defines — and the
+payer keeps it:
+
+```go
+receipt, err := paygate402.DecodeReceipt(response.Header.Get(paygate402.ReceiptHeader))
+err = signer.Verify(receipt) // this server issued it, and it has not been edited
+```
+
+`Issuer` names the server on every receipt it signs, for a payer that keeps
+receipts from more than one. The receipt carries the payment's replay key, so it
+belongs to one payment and cannot be moved to another.
+
+The signed form is the quote's, under the receipt's own domain tag, so one key
+can sign both without either being readable as the other. A receipt does not
+expire: a quote stops standing because the offer behind it is about to change,
+but a settlement stays settled, and a record that ran out would be no record at
+all.
+
+**Nothing carries a receipt until a payment settles.** A `402` has no settlement
+to record, and a payment the facilitator declined did not settle. Conversely, a
+receipt that could not be signed is logged and the paid response goes out
+anyway: the money has moved and the work is done, so an operator's mistake is
+not a reason to withhold a response the client has already paid for.
+
+That signature is this server's, not a chain's. It says "this payment settled
+here", which is this server's statement about its own accounting: `Transaction`
+is what the facilitator named, and a chain is where that is checked.
+
 ## Status
 
 Early, and pinned to a moving target: x402 is young, and this speaks
@@ -279,9 +320,9 @@ message rather than interpreted hopefully.
 
 | | |
 |---|---|
-| Implemented | 402 challenge, `X-PAYMENT` codec, terms matching, a price per route pattern, a free tier per client, replay protection in memory or in a file, facilitator client, a mock facilitator with in-memory balances, settlement ordering, payer on the context, signed quotes with a canonical serialisation, quotes carried on the 402 and checked on the way back |
+| Implemented | 402 challenge, `X-PAYMENT` codec, terms matching, a price per route pattern, a free tier per client, replay protection in memory or in a file, facilitator client, a mock facilitator with in-memory balances, settlement ordering, payer on the context, signed quotes with a canonical serialisation, quotes carried on the 402 and checked on the way back, signed settlement receipts on the paid response |
 | Delegated | signature verification, allowance checks, settlement — all to the facilitator |
-| Not yet | multiple concurrent schemes per resource, a price that depends on more of the request than its route, a replay store or free-tier counter shared between replicas, `X-PAYMENT-RESPONSE` verification on the client side |
+| Not yet | multiple concurrent schemes per resource, a price that depends on more of the request than its route, a replay store or free-tier counter shared between replicas, `X-PAYMENT-RESPONSE` verification on the client side, a route that accepts a receipt as proof of an earlier payment |
 
 Go 1.24 or newer. No dependencies outside the standard library.
 
