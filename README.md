@@ -127,18 +127,104 @@ allowance; it exists so that an agent can try an endpoint before paying for it.
 The tally lives in this process unless `Counts` is set, and shares
 `MemoryStore`'s limit: several replicas mean several allowances.
 
-## Where the boundary is
+## The flow
 
-**This package does not check signatures and does not move money.** In x402
-that is a facilitator's job: it reads the scheme-specific payload, recovers the
-signature, checks the allowance, and submits the transfer. That boundary is
-honoured here rather than blurred. A middleware that decoded some base64 and
-called it verification would be worse than no middleware, because it would look
-like a paywall while charging nobody.
+Three parties — a client, this server, a facilitator — and a chain behind the
+last of them. The request is made twice, and the second one is the protocol's
+whole cost: a client that has to be told the price cannot pay on the first try.
 
-So the payment payload stays opaque, and matching compares only what a web layer
-can honestly compare: the scheme and the network. The amount, the asset and the
-recipient are checked by the component that can read the payload.
+1. **The unpaid request.** The client asks for the resource with no `X-PAYMENT`
+   header. The gate answers `402` with the terms it accepts and, when it signs
+   quotes, the offer behind each of them.
+
+2. **The client signs.** It builds a payment for the terms it picked and signs
+   it with its own key, in whatever shape the scheme defines. That signature
+   authorises a transfer of the client's own funds, and it is the only
+   signature in the exchange with money behind it.
+
+3. **The retried request.** The same request again, carrying `X-PAYMENT` and
+   the `X-PAYMENT-QUOTE` it is answering. The gate checks what a web layer can
+   honestly check — that this server signed the offer, that the offer still
+   stands, that it is the offer for these terms, that the scheme and network
+   match, that this payment has not been used before — and nothing else.
+
+4. **The facilitator answers.** It reads the scheme-specific payload, recovers
+   the client's signature, checks the authorisation and the balance, and says
+   valid or not, naming the payer.
+
+5. **The handler runs, then the money moves.** The handler writes into a
+   buffer; the facilitator settles; only then is anything served, with
+   `X-PAYMENT-RESPONSE` and, when the server signs them, `X-PAYMENT-RECEIPT`.
+
+Nothing the gate does in step 3 is a cryptographic finding. Its part of the
+protocol is bookkeeping: which offer, which terms, spent or not.
+
+## Trust boundaries
+
+### Who signs what
+
+| Signature | Key | What it says | Checked by |
+|---|---|---|---|
+| the payment payload | the client's own, on chain | "I authorise this transfer" | the facilitator, and in the end the chain |
+| `X-PAYMENT-QUOTE` | this server's HMAC secret | "these were my terms, until this moment" | this server, when the quote comes back |
+| `X-PAYMENT-RECEIPT` | this server's HMAC secret | "this payment settled here" | this server, or whoever it hands the key to |
+
+The client's signature is the one that can move funds. The server's two are
+statements about its own offers and its own accounting, and they are symmetric:
+only a holder of the key can check them. A receipt is therefore a record for a
+payer to present back here, not a proof a third party can verify on its own. A
+transfer is checked on the chain, and `Transaction` is the thread to pull.
+
+### What the facilitator sees
+
+Everything sent to a facilitator is the protocol version, the payment payload
+verbatim, and the terms. So it learns the price, the asset, the recipient and
+the resource URL of every request that tries to pay — a metered record of what
+this server sells, and to which addresses. It is not sent the request body, the
+response, the other headers, the quote or the receipt.
+
+That disclosure is part of choosing a facilitator rather than a detail of it: a
+hosted one is a third party standing at the till. `Facilitator` is an interface,
+which is what makes running your own a configuration change.
+
+### What this library never does
+
+**No custody.** It holds no key that can move funds, signs nothing a chain
+would accept, and submits no transaction. Money moves between the payer and
+`PayTo`; nothing passes through this server, so there is no balance here to
+hold, to lose, or to be asked to give back.
+
+**No verification.** It does not recover a signature, read a payload, check an
+authorisation or look at a balance. The payload stays opaque, and matching
+compares only the scheme and the network — the amount, the asset and the
+recipient are checked by the component that can read the payload. A middleware
+that decoded some base64 and called it verification would be worse than no
+middleware, because it would look like a paywall while charging nobody.
+
+**No judgement about the payer.** `Payer(r.Context())` is the facilitator's
+claim repeated to the handler, not this package's finding.
+
+The one secret it does hold is the HMAC key for quotes and receipts. Leaked, it
+lets someone mint offers this server would honour — their own price for any
+resource — and forge records of settlements that never happened. That is worth
+a rotation and a bad afternoon, and it is not funds: quotes and receipts were
+never funds.
+
+### What has to be trusted
+
+The facilitator's answers. One that is compromised can call a payment valid
+that nobody made and report a settlement that never happened, and the gate
+would serve the response and sign a receipt for it. A web layer has no way
+round that — the component that can read the payload is the component that can
+lie about it — so a facilitator is chosen, or run, rather than checked.
+Transactions reconcile against the chain afterwards, which is where a lie shows
+up.
+
+Two smaller ones. The server's clock, because a quote's expiry is its own
+timestamp read back, and a clock that jumps backwards extends an offer it had
+already withdrawn. And the replay store, because a payment is spent only as far
+as the store that remembers it reaches: one process, or one file, or whatever
+shared implementation sits behind `SeenStore`.
 
 ## Testing without a chain
 
