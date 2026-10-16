@@ -24,6 +24,18 @@ type SeenStore interface {
 	SeenBefore(key string, ttl time.Duration) bool
 }
 
+// Releaser is a SeenStore that can take a payment back.
+//
+// The gate releases a payment whose handler answered outside 2xx: nothing was
+// delivered and nothing was settled, so the same signed payload has to go
+// through on a retry. A store that does not implement this leaves the payment
+// spent, which is the direction that cannot charge twice.
+type Releaser interface {
+	SeenStore
+	// Release forgets a key, as if it had never been recorded.
+	Release(key string)
+}
+
 // DefaultReplayWindow is how long a used payment is remembered when nothing
 // asks for a particular window.
 const DefaultReplayWindow = time.Hour
@@ -101,10 +113,22 @@ func (m *MemoryStore) SeenBefore(key string, ttl time.Duration) bool {
 	return false
 }
 
+// Release forgets a key, so the payment behind it can be presented again.
+func (m *MemoryStore) Release(key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.seen, key)
+}
+
 // compactAfter is the number of records a file is allowed to carry before a
 // rewrite is worth its cost. Below it the file is small enough that the dead
 // entries in it do not matter.
 const compactAfter = 64
+
+// releaseMarker stands where an expiry would be, on a line that takes a payment
+// back. An append-only log forgets by appending, and the later line wins when
+// the file is read again.
+const releaseMarker = "-"
 
 // FileStore keeps seen payments in a file, so that a restart does not hand a
 // captured X-PAYMENT header a second chance.
@@ -159,8 +183,23 @@ func (f *FileStore) SeenBefore(key string, ttl time.Duration) bool {
 	}
 	expires := now.Add(ttl)
 	f.seen[key] = expires
-	f.append(key, expires)
+	f.append(strconv.FormatInt(expires.UnixNano(), 10), key)
 	return false
+}
+
+// Release forgets a key, so the payment behind it can be presented again. The
+// file is given a line saying so rather than losing the one it already has: the
+// log is append-only, and on the way back in the release undoes the record it
+// follows.
+func (f *FileStore) Release(key string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if _, ok := f.seen[key]; !ok {
+		return
+	}
+	delete(f.seen, key)
+	f.append(releaseMarker, key)
 }
 
 // Close releases the file. The store keeps answering from memory afterwards, so
@@ -201,7 +240,15 @@ func (f *FileStore) load() error {
 		key, expires, ok := parseRecord(scan.Text())
 		// A line that does not parse is a line a crash cut in half. Everything
 		// written before it is still good, so it is skipped rather than fatal.
-		if !ok || !now.Before(expires) {
+		if !ok {
+			continue
+		}
+		if expires.IsZero() {
+			// A release, which takes back whatever the lines above it recorded.
+			delete(f.seen, key)
+			continue
+		}
+		if !now.Before(expires) {
 			continue
 		}
 		f.seen[key] = expires
@@ -212,16 +259,21 @@ func (f *FileStore) load() error {
 	return nil
 }
 
+// parseRecord reads one line of the log. A release comes back with the zero
+// time, which no recorded expiry can be.
 func parseRecord(line string) (string, time.Time, bool) {
-	nanos, key, found := strings.Cut(strings.TrimSpace(line), " ")
+	stamp, key, found := strings.Cut(strings.TrimSpace(line), " ")
 	if !found || key == "" {
 		return "", time.Time{}, false
 	}
-	stamp, err := strconv.ParseInt(nanos, 10, 64)
+	if stamp == releaseMarker {
+		return key, time.Time{}, true
+	}
+	nanos, err := strconv.ParseInt(stamp, 10, 64)
 	if err != nil {
 		return "", time.Time{}, false
 	}
-	return key, time.Unix(0, stamp), true
+	return key, time.Unix(0, nanos), true
 }
 
 func (f *FileStore) sweep(now time.Time) {
@@ -231,18 +283,19 @@ func (f *FileStore) sweep(now time.Time) {
 		}
 	}
 	// The file is only appended to, so it holds every entry ever written,
-	// expired ones included. Rewriting it once the dead outnumber the living
-	// keeps the rewrite rare and the file within a constant of what is live.
+	// expired and released ones included. Rewriting it once the dead outnumber
+	// the living keeps the rewrite rare and the file within a constant of what
+	// is live.
 	if f.records > compactAfter && f.records > 2*len(f.seen) {
 		f.keep(f.rewrite())
 	}
 }
 
-func (f *FileStore) append(key string, expires time.Time) {
+func (f *FileStore) append(stamp, key string) {
 	if f.file == nil {
 		return
 	}
-	if _, err := f.file.WriteString(strconv.FormatInt(expires.UnixNano(), 10) + " " + key + "\n"); err != nil {
+	if _, err := f.file.WriteString(stamp + " " + key + "\n"); err != nil {
 		f.keep(fmt.Errorf("replay store %s: %w", f.path, err))
 		return
 	}

@@ -258,9 +258,9 @@ the other side of it.
 ## The two orderings that matter
 
 **Settle after the handler, serve after settlement.** The handler runs into a
-buffer. If the work fails, nothing is charged; if settlement fails, nothing is
-served. A client never receives a paid response for a payment that did not
-settle, and never pays for a `503`.
+buffer. If the work fails, nothing is charged and the payment is given back; if
+settlement fails, nothing is served. A client never receives a paid response for
+a payment that did not settle, and never pays for a `503`.
 
 **An unreachable facilitator is a `502`, not a `402`.** "We could not ask" and
 "the answer is no" are different outcomes. Returning `402` when the facilitator
@@ -279,6 +279,18 @@ rejected never touched the chain, and the client who fixes their allowance may
 legitimately resend the same signed payload. Once settlement has been attempted
 the payment stays spent, even on failure — the ambiguous case must never risk a
 double charge.
+
+A payment whose handler failed is given back. The key is recorded before the
+work runs, so a `500` from the handler would otherwise leave a payment spent on
+a response nobody received; the gate releases it when the status is outside
+2xx, and the client can retry with the payment it already signed. Nothing was
+settled on that path, which is what makes releasing safe there and not after a
+failed settlement.
+
+`Release(key)` is optional. A `SeenStore` that does not have it keeps the
+payment spent — the direction that cannot charge twice — and both stores here do
+have it: `MemoryStore` forgets the key, and `FileStore` appends a line saying
+so, because an append-only log forgets by appending.
 
 A spent payment does not have to be remembered forever. It has to be remembered
 until the offer behind it stops standing, plus a margin for the difference
@@ -406,7 +418,7 @@ message rather than interpreted hopefully.
 
 | | |
 |---|---|
-| Implemented | 402 challenge, `X-PAYMENT` codec, terms matching, a price per route pattern, a free tier per client, replay protection in memory or in a file, facilitator client, a mock facilitator with in-memory balances, settlement ordering, payer on the context, signed quotes with a canonical serialisation, quotes carried on the 402 and checked on the way back, signed settlement receipts on the paid response |
+| Implemented | 402 challenge, `X-PAYMENT` codec, terms matching, a price per route pattern, a free tier per client, replay protection in memory or in a file, a payment released when its handler delivered nothing, facilitator client, a mock facilitator with in-memory balances, settlement ordering, payer on the context, signed quotes with a canonical serialisation, quotes carried on the 402 and checked on the way back, signed settlement receipts on the paid response |
 | Delegated | signature verification, allowance checks, settlement — all to the facilitator |
 | Not yet | multiple concurrent schemes per resource, a price that depends on more of the request than its route, a replay store or free-tier counter shared between replicas, `X-PAYMENT-RESPONSE` verification on the client side, a route that accepts a receipt as proof of an earlier payment |
 

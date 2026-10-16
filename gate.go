@@ -111,9 +111,11 @@ func (g *Gate) Handler(next http.Handler) http.Handler {
 		// The replay key is recorded only after verification passes. Recording
 		// at first sight would burn a payment the facilitator rejected — the
 		// client fixes the allowance and legitimately resends the same signed
-		// payload. Once recorded the payment stays spent even if settlement
-		// then fails: a settlement attempt may have reached the chain, and the
-		// ambiguous case must never risk a double charge.
+		// payload. Once settlement has been attempted the payment stays spent
+		// even on failure: the attempt may have reached the chain, and the
+		// ambiguous case must never risk a double charge. The one path that
+		// gives a recorded payment back is a handler that delivered nothing,
+		// below, where no settlement was attempted at all.
 		store := g.Seen
 		if store == nil {
 			store = defaultStore
@@ -130,7 +132,14 @@ func (g *Gate) Handler(next http.Handler) http.Handler {
 		next.ServeHTTP(recorder, r.WithContext(withPayer(r.Context(), verification.Payer)))
 
 		if recorder.status < 200 || recorder.status >= 300 {
-			// Nothing was delivered, so nothing is charged.
+			// Nothing was delivered, so nothing is charged — and nothing was
+			// settled either, so the payment is handed back rather than left
+			// spent on a response the client never got. A store that cannot
+			// release keeps it spent, which is the direction that cannot
+			// charge twice.
+			if releaser, ok := store.(Releaser); ok {
+				releaser.Release(PaymentKey(payment))
+			}
 			recorder.flush(w, "")
 			return
 		}
