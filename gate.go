@@ -2,6 +2,7 @@ package paygate402
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -9,6 +10,11 @@ import (
 	"strconv"
 	"time"
 )
+
+// DefaultSettleTimeout bounds a settlement call when Gate.SettleTimeout is not
+// set. It is a deadline rather than a connection, because the connection is
+// the thing that may already be gone.
+const DefaultSettleTimeout = 30 * time.Second
 
 // Gate wraps a handler so that it only runs for paid requests.
 type Gate struct {
@@ -37,8 +43,13 @@ type Gate struct {
 	// ReplayWindow is how long a used payment is remembered. Defaults to an hour,
 	// and is superseded by the offer's own lifetime when Quotes is set.
 	ReplayWindow time.Duration
+	// SettleTimeout bounds the settlement call, which runs on a context detached
+	// from the request's. Defaults to DefaultSettleTimeout.
+	SettleTimeout time.Duration
 	// Logger receives settlement failures, which are the events an operator
-	// most needs to see: the work was done and the money did not arrive.
+	// most needs to see: the work was done and the money did not arrive. It is
+	// also told every transaction that settles, which is the thread to pull when
+	// reconciling against the chain.
 	Logger *slog.Logger
 }
 
@@ -144,7 +155,16 @@ func (g *Gate) Handler(next http.Handler) http.Handler {
 			return
 		}
 
-		settlement, err := g.Facilitator.Settle(r.Context(), payment, terms)
+		// The handler's answer is the last thing the client's context is needed
+		// for, so settlement runs detached from it. A client that hung up the
+		// moment it had its response would otherwise abort the transfer
+		// mid-flight and leave the money in the one state nobody can act on:
+		// unknown. The timeout takes over from the connection as the thing that
+		// stops a facilitator holding this call forever.
+		settling, done := context.WithTimeout(context.WithoutCancel(r.Context()), g.settleTimeout())
+		defer done()
+
+		settlement, err := g.Facilitator.Settle(settling, payment, terms)
 		switch {
 		case err != nil:
 			g.log("settlement call failed", "error", err)
@@ -155,6 +175,11 @@ func (g *Gate) Handler(next http.Handler) http.Handler {
 			g.challenge(w, accepts, orDefault(settlement.ErrorReason, "payment could not be settled"))
 			return
 		}
+		g.note("payment settled",
+			"transaction", settlement.Transaction,
+			"payer", orDefault(settlement.Payer, verification.Payer),
+			"amount", terms.MaxAmountRequired,
+			"asset", terms.Asset)
 
 		encoded, err := EncodeSettlement(settlement)
 		if err != nil {
@@ -283,6 +308,13 @@ func (g *Gate) replayWindow() time.Duration {
 	return DefaultReplayWindow
 }
 
+func (g *Gate) settleTimeout() time.Duration {
+	if g.SettleTimeout > 0 {
+		return g.SettleTimeout
+	}
+	return DefaultSettleTimeout
+}
+
 // challenge writes the 402 that tells a client what would be accepted, and,
 // when this gate signs quotes, the offer behind each set of terms.
 func (g *Gate) challenge(w http.ResponseWriter, accepts []Requirements, why string) {
@@ -316,6 +348,15 @@ func (g *Gate) challenge(w http.ResponseWriter, accepts []Requirements, why stri
 func (g *Gate) log(message string, args ...any) {
 	if g.Logger != nil {
 		g.Logger.Error(message, args...)
+	}
+}
+
+// note records what went right. A settled transaction is the one identifier
+// that ties a served response to a movement on the chain, and an operator who
+// has to reconcile the two cannot go and ask for it later.
+func (g *Gate) note(message string, args ...any) {
+	if g.Logger != nil {
+		g.Logger.Info(message, args...)
 	}
 }
 

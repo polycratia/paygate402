@@ -267,6 +267,27 @@ a payment that did not settle, and never pays for a `503`.
 is down tells a client to pay a second time for something they may already have
 paid for.
 
+## Settlement outlives the connection
+
+By the time settlement starts, the work has been done. So a client that hangs up
+the moment it stops waiting must not take the transfer with it: settlement runs
+on a context detached from the request's, bounded by `SettleTimeout` instead of
+by the connection.
+
+```go
+gate.SettleTimeout = 30 * time.Second // the default
+```
+
+That cuts the other way too — the deadline is now the only thing stopping a
+silent facilitator from holding the call — so it is a timeout rather than no
+bound at all. Verification is unchanged and still runs on the request's own
+context: nothing has been delivered yet at that point, so a client that is gone
+before the facilitator answers costs nobody anything.
+
+Every settlement that succeeds is logged with its transaction, when a `Logger`
+is set. It is the one identifier tying a served response to a movement on the
+chain, and an operator reconciling the two cannot go back and ask for it.
+
 ## Replay
 
 A captured `X-PAYMENT` header is refused the second time. The replay key is a
@@ -418,7 +439,7 @@ message rather than interpreted hopefully.
 
 | | |
 |---|---|
-| Implemented | 402 challenge, `X-PAYMENT` codec, terms matching, a price per route pattern, a free tier per client, replay protection in memory or in a file, a payment released when its handler delivered nothing, facilitator client, a mock facilitator with in-memory balances, settlement ordering, payer on the context, signed quotes with a canonical serialisation, quotes carried on the 402 and checked on the way back, signed settlement receipts on the paid response |
+| Implemented | 402 challenge, `X-PAYMENT` codec, terms matching, a price per route pattern, a free tier per client, replay protection in memory or in a file, a payment released when its handler delivered nothing, facilitator client, a mock facilitator with in-memory balances, settlement ordering, settlement on a context the client cannot cancel, payer on the context, signed quotes with a canonical serialisation, quotes carried on the 402 and checked on the way back, signed settlement receipts on the paid response |
 | Delegated | signature verification, allowance checks, settlement — all to the facilitator |
 | Not yet | multiple concurrent schemes per resource, a price that depends on more of the request than its route, a replay store or free-tier counter shared between replicas, `X-PAYMENT-RESPONSE` verification on the client side, a route that accepts a receipt as proof of an earlier payment |
 
