@@ -100,6 +100,7 @@ type Settlement struct {
 // Errors a caller may want to distinguish.
 var (
 	ErrNoPayment      = errors.New("no payment presented")
+	ErrNoSettlement   = errors.New("no settlement reported")
 	ErrMalformed      = errors.New("payment header could not be decoded")
 	ErrWrongVersion   = errors.New("unsupported x402 version")
 	ErrNoMatchingTerm = errors.New("payment does not match any accepted terms")
@@ -151,6 +152,31 @@ func EncodeSettlement(s Settlement) (string, error) {
 		return "", err
 	}
 	return base64.StdEncoding.EncodeToString(body), nil
+}
+
+// DecodeSettlement reads an X-PAYMENT-RESPONSE header, which is the other half
+// of EncodeSettlement and the thing a paying client wants off the response.
+//
+// It says what the server reported, not what a chain saw: Transaction is the
+// thread to pull for that.
+func DecodeSettlement(header string) (Settlement, error) {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return Settlement{}, ErrNoSettlement
+	}
+	raw, err := base64.StdEncoding.DecodeString(header)
+	if err != nil {
+		// Some servers strip padding; try the tolerant alphabet before giving up.
+		raw, err = base64.RawStdEncoding.DecodeString(header)
+		if err != nil {
+			return Settlement{}, fmt.Errorf("%w: %v", ErrMalformed, err)
+		}
+	}
+	var settlement Settlement
+	if err := json.Unmarshal(raw, &settlement); err != nil {
+		return Settlement{}, fmt.Errorf("%w: %v", ErrMalformed, err)
+	}
+	return settlement, nil
 }
 
 // Match finds the terms a payment is answering.
