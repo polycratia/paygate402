@@ -187,3 +187,27 @@ func TestAReplayWindowOutlivesTheQuoteItIsFor(t *testing.T) {
 		t.Errorf("window = %s, want the default margin", got)
 	}
 }
+
+// The lower bound the margin exists for: however far apart the clock that
+// stamped the offer and the clock reading it back are, the payment is still
+// remembered until the margin has closed past the expiry. A disagreement inside
+// the margin therefore cannot find the payment forgotten, which is the window a
+// replay would otherwise arrive in.
+func TestAReplayWindowCoversTheMarginWhicheverWayTheClocksDisagree(t *testing.T) {
+	const margin = 2 * time.Minute
+	expiry := quote().Expiry
+
+	for _, skew := range []time.Duration{-time.Hour, -time.Minute, 0, time.Minute, time.Hour} {
+		now := expiry.Add(skew)
+		window := ReplayWindowFor(quote(), now, margin)
+
+		if window < margin {
+			t.Errorf("window = %s read %s from the expiry, want never less than the %s margin",
+				window, skew, margin)
+		}
+		if forgotten := now.Add(window); forgotten.Before(expiry.Add(margin)) {
+			t.Errorf("a payment against an offer good until %s is forgotten at %s, before the margin closes",
+				expiry.UTC(), forgotten.UTC())
+		}
+	}
+}

@@ -62,6 +62,18 @@ func PaymentKey(payment Payment) string {
 // is there because the clock that decides a quote expired is not the clock that
 // stamped it, and the gap between them must not be a window to replay in. A
 // quote that has already expired still earns the margin, for the same reason.
+//
+// That leaves the margin bounded from both sides, which is what makes it a
+// number worth choosing rather than guessing. It has to be longer than the p99
+// of the gap it covers — the clock disagreement between the server that stamped
+// the offer and the one reading it back, plus the time a payment spends in
+// flight — because a replay arrives in the tail of that distribution rather
+// than at its median. And it is not worth making it longer than the horizon
+// over which a client still retries the same request: past the expiry and past
+// that horizon nothing will present the payment again, so the key is kept for
+// nobody. Nothing legitimate is refused at that end either, because a client
+// retrying that late needs a fresh quote, and a fresh quote is answered by a
+// payment with its own key.
 func ReplayWindowFor(quote Quote, now time.Time, safety time.Duration) time.Duration {
 	if safety <= 0 {
 		safety = DefaultReplaySafety
