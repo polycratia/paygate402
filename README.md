@@ -127,6 +127,55 @@ allowance; it exists so that an agent can try an endpoint before paying for it.
 The tally lives in this process unless `Counts` is set, and shares
 `MemoryStore`'s limit: several replicas mean several allowances.
 
+## Paying for a 402
+
+The other side of the gate. `Transport` is an `http.RoundTripper` that answers
+one `402` with one payment:
+
+```go
+client := &http.Client{Transport: &paygate402.Transport{
+	Wallet:  wallet,
+	Settled: func(s paygate402.Settlement) { log.Println("paid", s.Transaction) },
+}}
+
+response, err := client.Get("https://api.example.com/report")
+```
+
+On a `402` it asks the wallet for a payment for the terms the challenge named,
+repeats the request with `X-PAYMENT` and the `X-PAYMENT-QUOTE` that offer
+arrived on, and returns the second response. One payment, one retry: a `402`
+answering the retry comes back as it is rather than being paid for a second
+time, and a request that already carries an `X-PAYMENT` header is not paid for
+at all — it has been paid for once already.
+
+`Wallet` is on the client side what `Facilitator` is on the server side:
+
+```go
+type Wallet interface {
+	Pay(ctx context.Context, terms Requirements, offer Quote) (Payment, error)
+}
+```
+
+The offer is the quote the `402` carried for those terms, or the zero `Quote`
+when the server signs none, so a wallet can check the price it is about to
+authorise against what the server put its signature on. The key that authorises
+the transfer lives behind that interface, and this package holds none.
+
+**A body that cannot be resent is never paid for.** The retry is the same
+request again, so it needs the same body, and a bare stream has no second copy —
+net/http says so by leaving `GetBody` nil. That `402` is handed back untouched,
+terms and all, so a caller can buffer the body and pay deliberately. Paying
+first would buy a response for a request that can no longer be made.
+
+`Settled`, when set, receives the `X-PAYMENT-RESPONSE` of a paid response,
+decoded; `DecodeSettlement` reads the header directly for a caller who wants to
+see an absent or unreadable one as well. It says what the server reported, not
+what a chain saw.
+
+A wallet that cannot pay is an error out of the round trip rather than a `402`
+passed through. "I could not pay" and "the server refused" are different
+outcomes, and only the second one is a response.
+
 ## The flow
 
 Three parties — a client, this server, a facilitator — and a chain behind the
@@ -192,7 +241,8 @@ which is what makes running your own a configuration change.
 **No custody.** It holds no key that can move funds, signs nothing a chain
 would accept, and submits no transaction. Money moves between the payer and
 `PayTo`; nothing passes through this server, so there is no balance here to
-hold, to lose, or to be asked to give back.
+hold, to lose, or to be asked to give back. On the client side the same line is
+drawn by `Wallet`: the key that authorises a transfer lives behind it.
 
 **No verification.** It does not recover a signature, read a payload, check an
 authorisation or look at a balance. The payload stays opaque, and matching
@@ -250,6 +300,10 @@ header, err := paygate402.EncodePayment(payment)
 // …send that header through the gate, then:
 facilitator.Balance("0xc0ffee") // 40_000, and the merchant has the charge
 ```
+
+`MockPayment` is also what a test wallet returns, so a `Transport` and a `Gate`
+can be run against each other in one process: the client pays, the gate
+verifies, the mock moves the money, and the balances say what happened.
 
 It signs nothing and verifies no signature, so it proves the plumbing rather
 than the cryptography. That is the point of the seam: the cryptography lives on
@@ -439,9 +493,9 @@ message rather than interpreted hopefully.
 
 | | |
 |---|---|
-| Implemented | 402 challenge, `X-PAYMENT` codec, terms matching, a price per route pattern, a free tier per client, replay protection in memory or in a file, a payment released when its handler delivered nothing, facilitator client, a mock facilitator with in-memory balances, settlement ordering, settlement on a context the client cannot cancel, payer on the context, signed quotes with a canonical serialisation, quotes carried on the 402 and checked on the way back, signed settlement receipts on the paid response |
+| Implemented | 402 challenge, `X-PAYMENT` codec, terms matching, a price per route pattern, a free tier per client, replay protection in memory or in a file, a payment released when its handler delivered nothing, facilitator client, a mock facilitator with in-memory balances, settlement ordering, settlement on a context the client cannot cancel, payer on the context, signed quotes with a canonical serialisation, quotes carried on the 402 and checked on the way back, signed settlement receipts on the paid response, a client transport that answers one 402 with one payment |
 | Delegated | signature verification, allowance checks, settlement — all to the facilitator |
-| Not yet | multiple concurrent schemes per resource, a price that depends on more of the request than its route, a replay store or free-tier counter shared between replicas, `X-PAYMENT-RESPONSE` verification on the client side, a route that accepts a receipt as proof of an earlier payment |
+| Not yet | multiple concurrent schemes per resource, a price that depends on more of the request than its route, a replay store or free-tier counter shared between replicas, a wallet for a real scheme's payload, a route that accepts a receipt as proof of an earlier payment |
 
 Go 1.24 or newer. No dependencies outside the standard library.
 
